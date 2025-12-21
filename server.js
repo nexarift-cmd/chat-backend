@@ -4,78 +4,121 @@ const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
     origin: "*"
   }
 });
 
-/* ---------- DONNÉES EN MÉMOIRE ---------- */
+const PORT = process.env.PORT || 3000;
 
-const users = {};          // username -> socket.id
-const friends = {};        // username -> [amis]
-const dmHistory = {};      // "user1|user2" -> messages
-const groups = {};         // groupId -> { name, members, messages }
+/* =======================
+   STOCKAGE (TEMPORAIRE)
+======================= */
 
-/* ---------- SOCKET ---------- */
+const users = {}; // socketId -> user
+const usersByName = {}; // username -> socketId
+const friends = {}; // username -> [friends]
+const friendRequests = {}; // username -> [requests]
+
+const messagesDM = {}; // roomId -> messages[]
+const groups = {}; // groupId -> { name, members, messages }
+
+/* =======================
+   UTILS
+======================= */
+
+function dmRoom(a, b) {
+  return [a, b].sort().join("_");
+}
+
+/* =======================
+   SOCKET.IO
+======================= */
 
 io.on("connection", (socket) => {
+  console.log("🟢 Connecté :", socket.id);
 
-  /* LOGIN */
+  /* ---------- LOGIN ---------- */
   socket.on("login", (username) => {
-    socket.username = username;
-    users[username] = socket.id;
+    users[socket.id] = { username };
+    usersByName[username] = socket.id;
 
-    if (!friends[username]) friends[username] = [];
+    friends[username] ??= [];
+    friendRequests[username] ??= [];
 
-    console.log(username, "connecté");
+    io.emit("statusUpdate", {
+      user: username,
+      online: true
+    });
   });
 
-  /* ---------- DEMANDE D’AMI ---------- */
-
-  socket.on("friendRequest", (toUser) => {
-    const fromUser = socket.username;
-    const targetSocket = users[toUser];
-
-    if (!targetSocket) return;
-
-    io.to(targetSocket).emit("friendRequest", fromUser);
+  /* ---------- RECHERCHE UTILISATEUR ---------- */
+  socket.on("searchUser", (username, cb) => {
+    cb(usersByName[username] ? true : false);
   });
 
-  socket.on("acceptFriend", (fromUser) => {
-    const toUser = socket.username;
+ socket.on("acceptFriend", (fromUser) => {
+  const toUser = users[socket.id]?.username;
+  if (!toUser) return;
 
+  friends[toUser] ??= [];
+  friends[fromUser] ??= [];
+
+  if (!friends[toUser].includes(fromUser)) {
     friends[toUser].push(fromUser);
     friends[fromUser].push(toUser);
+  }
 
-    io.to(users[fromUser]).emit("friendAccepted", toUser);
-    socket.emit("friendAccepted", fromUser);
-  });
+  friendRequests[toUser] =
+    (friendRequests[toUser] || []).filter(u => u !== fromUser);
 
-  /* ---------- DM ---------- */
+  // Notifier les deux
+  socket.emit("friendAccepted", fromUser);
 
-  socket.on("joinDM", (otherUser) => {
-    const key = [socket.username, otherUser].sort().join("|");
-    socket.join(key);
+  const fromSocket = usersByName[fromUser];
+  if (fromSocket) {
+    io.to(fromSocket).emit("friendAccepted", toUser);
+  }
+});
 
-    socket.emit("dmHistory", dmHistory[key] || []);
+  /* ---------- MESSAGES PRIVÉS ---------- */
+  socket.on("joinDM", (friend) => {
+    const me = users[socket.id].username;
+    const room = dmRoom(me, friend);
+
+    socket.join(room);
+
+    socket.emit("dmHistory", messagesDM[room] || []);
   });
 
   socket.on("privateMessage", ({ to, message }) => {
-    const from = socket.username;
-    const key = [from, to].sort().join("|");
+    const from = users[socket.id].username;
+    const room = dmRoom(from, to);
 
-    if (!dmHistory[key]) dmHistory[key] = [];
+    messagesDM[room] ??= [];
 
-    const msg = { from, message };
-    dmHistory[key].push(msg);
+    const msg = {
+      from,
+      message,
+      time: Date.now()
+    };
 
-    io.to(key).emit("privateMessage", msg);
+    messagesDM[room].push(msg);
+    io.to(room).emit("privateMessage", msg);
+  });
+
+  /* ---------- TYPING ---------- */
+  socket.on("typing", ({ to, typing }) => {
+    io.to(usersByName[to]).emit("typing", {
+      from: users[socket.id].username,
+      typing
+    });
   });
 
   /* ---------- GROUPES ---------- */
-
-  socket.on("createGroup", ({ name, members }, callback) => {
+  socket.on("createGroup", ({ name, members }, cb) => {
     const id = Date.now().toString();
 
     groups[id] = {
@@ -84,43 +127,54 @@ io.on("connection", (socket) => {
       messages: []
     };
 
-    callback(id);
+    members.forEach(m => {
+      io.to(usersByName[m]).emit("groupCreated", {
+        id,
+        name
+      });
+    });
+
+    cb(id);
   });
 
   socket.on("joinGroup", (groupId) => {
-    socket.join(groupId);
-    socket.emit("groupHistory", groups[groupId]?.messages || []);
+    socket.join("group_" + groupId);
+    socket.emit("groupHistory", groups[groupId].messages);
   });
 
   socket.on("groupMessage", ({ groupId, message }) => {
-    const msg = { from: socket.username, message };
+    const from = users[socket.id].username;
+
+    const msg = {
+      from,
+      message,
+      time: Date.now()
+    };
+
     groups[groupId].messages.push(msg);
-    io.to(groupId).emit("groupMessage", msg);
+
+    io.to("group_" + groupId).emit("groupMessage", msg);
   });
 
-  /* ---------- TYPING ---------- */
-
-  socket.on("typing", ({ to, typing }) => {
-    const target = users[to];
-    if (target) {
-      io.to(target).emit("typing", {
-        from: socket.username,
-        typing
-      });
-    }
-  });
-
-  /* DISCONNECT */
+  /* ---------- DÉCONNEXION ---------- */
   socket.on("disconnect", () => {
-    if (socket.username) {
-      delete users[socket.username];
-      console.log(socket.username, "déconnecté");
-    }
+    const user = users[socket.id];
+    if (!user) return;
+
+    io.emit("statusUpdate", {
+      user: user.username,
+      online: false
+    });
+
+    delete usersByName[user.username];
+    delete users[socket.id];
   });
 });
 
-/* ---------- SERVER ---------- */
+/* =======================
+   START
+======================= */
 
-server.listen(3000, () => {
-  console.log("Socket.IO server running on port 3000");
+server.listen(PORT, () => {
+  console.log("🚀 Server running on port", PORT);
 });
