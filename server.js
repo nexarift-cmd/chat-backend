@@ -9,7 +9,7 @@ const server = http.createServer(app);
 
 /* 🔒 CORS — bloque les sites copiés */
 const ALLOWED_ORIGINS = [
-  "poetic-granita-8b842f.netlify.app" // à remplacer
+  "https://poetic-granita-8b842f.netlify.app" // à remplacer
 ];
 
 app.use(cors({
